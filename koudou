@@ -1,0 +1,389 @@
+#local
+import shutil
+
+# Source path
+train_data = './train'
+test_data  = './test'
+
+# Destination path
+train = '/content/train'
+test = '/content/test'
+
+# Copy the content of
+# source to destination
+destination = shutil.copytree(train_data, train, dirs_exist_ok=True)
+destination = shutil.copytree(test_data, test, dirs_exist_ok=True)
+
+from imutils import paths
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import shutil
+import cv2
+import os
+
+from tensorflow_docs.vis import embed
+from tensorflow import keras
+from imutils import paths
+
+import numpy
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import pandas as pd
+import numpy as np
+import imageio
+import cv2
+import os
+
+IMG_SIZE = 224#動画の幅、高さ
+MAX_SEQ_LENGTH = 90 #動画のフレーム
+NUM_FEATURES = 2048
+
+# train_df = pd.read_csv("train.csv")
+# test_df = pd.read_csv("test.csv")
+train_df = pd.read_csv("12class_train.csv")
+test_df = pd.read_csv("12class_test.csv")
+
+print(f"Total videos for training: {len(train_df)}")
+print(f"Total videos for testing: {len(test_df)}")
+
+train_df.sample(30)
+
+#only icon
+def crop_center_square(frame): #入力動画を一部切り取る関数
+    y,x = frame.shape[0:2]
+    start_x = 720
+    start_y = 960
+    return frame[start_y : start_y + 360, start_x : start_x + 360]
+
+# 動画を読み込んで加工する関数
+def load_video(path, max_frames=MAX_SEQ_LENGTH, resize=(IMG_SIZE, IMG_SIZE)):
+    cap = cv2.VideoCapture(path)
+    frames = []
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 切り取り処理
+            frame = crop_center_square(frame)
+
+            padded_frame = np.zeros((360, 360, 3), dtype=np.uint8)
+
+            # 切り取った画像を黒背景の中央に配置
+            h, w = frame.shape[:2]
+            start_x = (360 - w) // 2
+            start_y = (360 - h) // 2
+            padded_frame[start_y:start_y + h, start_x:start_x + w] = frame
+
+            padded_frame = cv2.resize(padded_frame, resize)
+
+            # 色順変更（BGR → RGB）
+            padded_frame = padded_frame[:, :, [2, 1, 0]]
+            frames.append(padded_frame)
+
+            if len(frames) == max_frames:
+                break
+    finally:
+        cap.release()
+    return np.array(frames)#only icon
+def crop_center_square(frame): #入力動画を一部切り取る関数
+    y,x = frame.shape[0:2]
+    start_x = 720
+    start_y = 960
+    return frame[start_y : start_y + 360, start_x : start_x + 360]
+
+# 動画を読み込んで加工する関数
+def load_video(path, max_frames=MAX_SEQ_LENGTH, resize=(IMG_SIZE, IMG_SIZE)):
+    cap = cv2.VideoCapture(path)
+    frames = []
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 切り取り処理
+            frame = crop_center_square(frame)
+
+            padded_frame = np.zeros((360, 360, 3), dtype=np.uint8)
+
+            # 切り取った画像を黒背景の中央に配置
+            h, w = frame.shape[:2]
+            start_x = (360 - w) // 2
+            start_y = (360 - h) // 2
+            padded_frame[start_y:start_y + h, start_x:start_x + w] = frame
+
+            padded_frame = cv2.resize(padded_frame, resize)
+
+            # 色順変更（BGR → RGB）
+            padded_frame = padded_frame[:, :, [2, 1, 0]]
+            frames.append(padded_frame)
+
+            if len(frames) == max_frames:
+                break
+    finally:
+        cap.release()
+    return np.array(frames)
+
+def build_feature_extractor():#特徴抽出
+    feature_extractor = tf.keras.applications.InceptionV3(
+        weights="imagenet",
+        include_top=False,
+        pooling="avg",
+        input_shape=(IMG_SIZE, IMG_SIZE, 3),
+    )
+    preprocess_input = tf.keras.applications.inception_v3.preprocess_input
+
+    inputs = tf.keras.Input((IMG_SIZE, IMG_SIZE, 3))
+    preprocessed = preprocess_input(inputs)
+
+    outputs = feature_extractor(preprocessed)
+    return tf.keras.Model(inputs, outputs, name="feature_extractor")
+
+
+feature_extractor = build_feature_extractor()
+
+feature_extractor.summary()
+
+label_processor = keras.layers.StringLookup(
+    num_oov_indices=0, vocabulary=np.unique(train_df["tag"])
+)#StringLookup層でラベルの文字列を数値に変換
+print(label_processor.get_vocabulary())#変換した数値に対応するラベルを取り出す
+
+def prepare_all_videos(df, root_dir):
+    num_samples = len(df)#csvファイルの行＝動画データの個数
+    video_paths = df["video_name"].values.tolist()
+    labels = df["tag"].values
+    labels = label_processor(labels[..., None]).numpy()
+
+    # `frame_masks` and `frame_features` are what we will feed to our sequence model.
+    # `frame_masks` will contain a bunch of booleans denoting if a timestep is
+    # masked with padding or not.
+    frame_masks = np.zeros(shape=(num_samples, MAX_SEQ_LENGTH), dtype="bool")
+    frame_features = np.zeros(
+        shape=(num_samples, MAX_SEQ_LENGTH, NUM_FEATURES), dtype="float32"
+    )
+
+    # For each video.
+    for idx, path in enumerate(video_paths):
+        # Gather all its frames and add a batch dimension.
+        frames = load_video(os.path.join(root_dir, path))
+        frames = frames[None, ...]
+
+        # Initialize placeholders to store the masks and features of the current video.
+        temp_frame_mask = np.zeros(shape=(1, MAX_SEQ_LENGTH,), dtype="bool")
+        temp_frame_features = np.zeros(
+            shape=(1, MAX_SEQ_LENGTH, NUM_FEATURES), dtype="float32"
+        )
+
+        # Extract features from the frames of the current video.
+        for i, batch in enumerate(frames):
+            video_length = batch.shape[0]
+            length = min(MAX_SEQ_LENGTH, video_length)
+            for j in range(length):
+                temp_frame_features[i, j, :] = feature_extractor.predict(
+                    batch[None, j, :]
+                )
+            temp_frame_mask[i, :length] = 1  # 1 = not masked, 0 = masked
+
+        frame_features[idx,] = temp_frame_features.squeeze()
+        frame_masks[idx,] = temp_frame_mask.squeeze()
+
+    return (frame_features, frame_masks), labels
+
+
+train_data, train_labels = prepare_all_videos(train_df, "train")
+test_data, test_labels = prepare_all_videos(test_df, "test")
+
+print(f"Frame features in train set: {train_data[0].shape}")
+print(f"Frame masks in train set: {train_data[1].shape}")
+
+import pickle
+pickle.dump(train_data,open('save_train_data','wb'))
+pickle.dump(train_labels,open('save_train_label','wb'))
+pickle.dump(test_data,open('save_test_data','wb'))
+pickle.dump(test_labels,open('save_test_label','wb'))
+
+import pickle
+train_data=pickle.load(open('save_train_data','rb'))
+train_labels=pickle.load(open('save_train_label','rb'))
+test_data=pickle.load(open('save_test_data','rb'))
+test_labels=pickle.load(open('save_test_label','rb'))
+
+from keras.utils import to_categorical
+train_labels_onehot = to_categorical(train_labels)
+test_labels_onehot = to_categorical(test_labels)
+
+BATCH_SIZE = 128
+EPOCHS = 500
+
+def get_sequence_model():
+    class_vocab = label_processor.get_vocabulary()
+
+    frame_features_input = tf.keras.Input((MAX_SEQ_LENGTH, NUM_FEATURES))
+    mask_input = tf.keras.Input((MAX_SEQ_LENGTH,), dtype="bool")
+
+    # Refer to the following tutorial to understand the significance of using `mask`:
+    # https://keras.io/api/layers/recurrent_layers/gru/
+    x = tf.keras.layers.GRU(16, return_sequences=True)(
+        frame_features_input, mask=mask_input
+    )
+    x = tf.keras.layers.GRU(8)(x)
+    x = tf.keras.layers.Dropout(0.4)(x)
+    x = tf.keras.layers.Dense(8, activation="relu")(x)
+    output = tf.keras.layers.Dense(len(class_vocab), activation="softmax")(x)
+
+    rnn_model = tf.keras.Model([frame_features_input, mask_input], output)
+
+    rnn_model.compile(
+        #loss="sparse_categorical_crossentropy",
+        loss="categorical_crossentropy",
+        optimizer="adam", metrics=["accuracy"]
+    )
+    return rnn_model
+
+
+# Utility for running experiments.
+def run_experiment():
+    filepath = "/lol"
+    checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        filepath, save_weights_only=True, save_best_only=True, verbose=1
+    )
+
+    seq_model = get_sequence_model()
+    history = seq_model.fit(
+        [train_data[0], train_data[1]],
+        train_labels_onehot,
+        #validation_split=0.3,
+        validation_data=([test_data[0], test_data[1]], test_labels_onehot),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=[checkpoint],
+    )
+
+    seq_model.load_weights(filepath)
+    _, accuracy = seq_model.evaluate([test_data[0], test_data[1]], test_labels_onehot)
+    print(f"Test accuracy: {round(accuracy * 100, 2)}%")
+    seq_model.save(filepath)#モデルのセーブ
+
+    return history, seq_model
+
+#_, sequence_model = run_experiment()
+history, sequence_model = run_experiment()
+
+print(sequence_model.summary())
+
+import matplotlib.pyplot as plt
+
+loss=history.history['loss']
+val_loss=history.history['val_loss']
+
+nb_epoch=len(loss)
+print("loss_accuracy", "loss_accuracy*100%")
+plt.plot(range(nb_epoch),loss,marker=',',label='loss')
+plt.plot(range(nb_epoch),val_loss,marker=',',label='val_loss')
+plt.legend(loc='best',fontsize=10)
+plt.xlim([0,500])
+plt.ylim([0,2.5])
+plt.grid()
+plt.xlabel('epoch')
+plt.ylabel('loss')
+plt.show()
+
+accuracy = history.history['accuracy']
+val_accuracy = history.history['val_accuracy']
+
+nb_epoch = len(accuracy)
+plt.plot(range(nb_epoch), accuracy, marker='.', label='accuracy')
+plt.plot(range(nb_epoch), val_accuracy, marker='.', label='val_accuracy')
+plt.legend(loc='best', fontsize=10)
+plt.ylim([0,1.05])
+plt.xlabel('epoch')
+plt.ylabel('accuracy')
+plt.show()
+
+def prepare_single_video(frames):
+    frames = frames[None, ...]
+    frame_mask = np.zeros(shape=(1, MAX_SEQ_LENGTH,), dtype="bool")
+    frame_features = np.zeros(shape=(1, MAX_SEQ_LENGTH, NUM_FEATURES), dtype="float32")
+
+    for i, batch in enumerate(frames):
+        video_length = batch.shape[0]
+        length = min(MAX_SEQ_LENGTH, video_length)
+        for j in range(length):
+
+            frame_features[i, j, :] = feature_extractor.predict(batch[None, j, :])
+        frame_mask[i, :length] = 1  # 1 = not masked, 0 = masked
+
+    return frame_features, frame_mask
+
+
+def sequence_prediction(path):
+    class_vocab = label_processor.get_vocabulary()
+
+    frames = load_video(os.path.join("test", path))
+    frame_features, frame_mask = prepare_single_video(frames)
+    probabilities = sequence_model.predict([frame_features, frame_mask])[0]
+
+    for i in np.argsort(probabilities)[::-1]:
+        print(f"  {class_vocab[i]}: {probabilities[i] * 100:5.2f}%")
+    return frames
+
+
+# This utility is for visualization.
+# Referenced from:
+# https://www.tensorflow.org/hub/tutorials/action_recognition_with_tf_hub
+def to_gif(images):
+    converted_images = images.astype(np.uint8)
+    imageio.mimsave("animation.gif", converted_images, duration=10)
+    return embed.embed_file("animation.gif")
+
+test_video = "clove_skill1 (1).mp4"
+test_frames = sequence_prediction(test_video)
+print(f"Test video path: {test_video}")
+to_gif(test_frames[:MAX_SEQ_LENGTH])
+
+result_list= []
+video_list = ['clove_skill1', 'clove_skill2', 'clove_skill3', 'omen_skill1', 'omen_skill2', 'omen_skill3', 'viper_skill1', 'viper_skill2', 'viper_skill3','gekko_skill1','gekko_skill2','gekko_skill3']
+for i in video_list:
+    for j in range(18):
+        name = i + " ({0:01}).mp4".format(j+1)
+        test_video = name
+        print(f"Test video path: {test_video}")
+        frames = load_video(os.path.join("test", test_video))
+        frame_features, frame_mask = prepare_single_video(frames)
+        probabilities = sequence_model.predict([frame_features, frame_mask])[0]
+        print(probabilities)
+        pred= probabilities.argmax()
+        print(pred)
+        result_list.append(pred)
+        print(result_list)
+
+pip install seaborn
+
+import numpy as np
+import pandas as pd
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+y_true=test_labels
+y_pred=result_list
+
+import seaborn as sns
+confusion_mtx = tf.math.confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(12, 9))
+sns.heatmap(confusion_mtx,
+            xticklabels=label_processor.get_vocabulary(),
+            yticklabels=label_processor.get_vocabulary(),
+            annot=True, fmt='g',
+            annot_kws={"size":18})
+plt.xticks(fontsize=10)
+plt.yticks(fontsize=18)
+plt.xlabel('Prediction', fontsize=16)
+plt.ylabel('True', fontsize=16)
+plt.show()
+
+result_list

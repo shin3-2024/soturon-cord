@@ -1,0 +1,232 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+import shutil
+
+# Source path
+three_class_data = '/content/drive/Shareddrives/村田研究室_2024年度卒業/ShinseiMatsunaga/フォルダの名前/valo_3class/'
+
+# Destination path
+data = '/content/data'
+# Copy the content of
+# source to destination
+destination = shutil.copytree(three_class_data, data, dirs_exist_ok=True)
+
+from imutils import paths
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+import shutil
+import cv2
+import os
+
+!pip install -q git+https://github.com/tensorflow/docs
+
+from tensorflow_docs.vis import embed
+from tensorflow import keras
+from imutils import paths
+
+import numpy
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import pandas as pd
+import numpy as np
+import imageio
+import cv2
+import os
+
+IMG_SIZE = 224#動画の幅、高さ
+MAX_SEQ_LENGTH = 1 #動画のフレーム
+NUM_FEATURES = 2048
+
+train_df = pd.read_csv("6class_train.csv")
+test_df = pd.read_csv("6class_test.csv")
+
+print(f"Total videos for training: {len(train_df)}")
+print(f"Total videos for testing: {len(test_df)}")
+
+train_df.sample(15)
+
+def crop_center_square(frame): #入力動画を一部切り取る関数
+    y,x = frame.shape[0:2]
+    start_x = 736
+    start_y = 970
+    return frame[start_y : start_y + 97, start_x : start_x + 97]
+
+
+
+def load_video(path, max_frames=1, resize=(IMG_SIZE, IMG_SIZE)):
+    cap = cv2.VideoCapture(path)#動画を読み込む
+    frames = []
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            # print(frame.shape)
+            frame = crop_center_square(frame)
+            # print(frame.shape)
+            frame = cv2.resize(frame, resize)
+            frame = frame[:, :, [2, 1, 0]]
+            frames.append(frame)
+
+            if len(frames) == max_frames:
+                break
+    finally:
+        cap.release()
+    return np.array(frames)
+
+def check_wh(path):
+    cap = cv2.VideoCapture(path)
+    ret, frame = cap.read()
+    return frame.shape
+
+list(train_df["video_name"])
+train=[]
+for i in list(train_df["video_name"]):
+    train.append(load_video('/content/drive/Shareddrives/村田研究室_2024年度卒業/ShinseiMatsunaga/フォルダの名前/valo_3class/' + i ))
+    # shape = check_wh("/content/drive/Shareddrives/村田研究室_2024年度卒業/ShinseiMatsunaga/フォルダの名前/valo_2class/"+i)
+    # if shape[0] != 1080:
+    #     print("Error")
+
+tmp = np.zeros((len(list(train_df["video_name"])),224,224,3))
+for k,i in enumerate(list(train_df["video_name"])):
+    tmp[k] = load_video('/content/drive/Shareddrives/村田研究室_2024年度卒業/ShinseiMatsunaga/フォルダの名前/valo_3class/' + i )
+
+list(test_df["video_name"])
+test=[]
+for i in list(test_df["video_name"]):
+    test.append(load_video('/content/drive/Shareddrives/村田研究室_2024年度卒業/ShinseiMatsunaga/フォルダの名前/valo_3class/' + i ))
+
+tmp2 = np.zeros((len(list(test_df["video_name"])),224,224,3))
+for k,i in enumerate(list(test_df["video_name"])):
+    tmp2[k] = load_video('/content/drive/Shareddrives/村田研究室_2024年度卒業/ShinseiMatsunaga/フォルダの名前/valo_3class/' + i )
+
+plt.imshow(tmp[int(np.random.uniform(0,len(tmp))),:,:,:] / 255)
+
+feature_extractor = tf.keras.applications.InceptionV3(
+        weights="imagenet",
+        include_top=False,
+        pooling="avg",
+        input_shape=(IMG_SIZE, IMG_SIZE, 3),)
+# InceptionV3の重みを固定
+feature_extractor.trainable = False
+preprocess_input = tf.keras.applications.inception_v3.preprocess_input
+
+#モデル作成
+inputs = tf.keras.Input((IMG_SIZE, IMG_SIZE, 3))
+preprocessed = preprocess_input(inputs)
+outputs = feature_extractor(preprocessed)
+outputs = tf.keras.layers.Dense(6 ,activation="softmax")(outputs)
+model = tf.keras.Model(inputs, outputs)
+
+model.compile(optimizer='adam',loss="categorical_crossentropy", metrics=["accuracy"])
+
+model.summary()
+
+label_processor = keras.layers.StringLookup(
+    num_oov_indices=0, vocabulary=np.unique(train_df["tag"])
+)#StringLookup層でラベルの文字列を数値に変換
+print(label_processor.get_vocabulary())#変換した数値に対応するラベルを取り出す
+
+def labels(df):
+    num_samples = len(df)#csvファイルの行＝動画データの個数
+    video_paths = df["video_name"].values.tolist()
+    labels = df["tag"].values
+    labels = label_processor(labels[..., None]).numpy()
+    return labels
+
+train_labels = labels(train_df)
+test_labels = labels(test_df)
+
+from keras.utils import to_categorical #one hotに変換
+train_labels_onehot = to_categorical(train_labels)
+test_labels_onehot = to_categorical(test_labels)
+
+def prepare_all_videos(df, root_dir):
+    num_samples = len(df)#csvファイルの行＝動画データの個数
+    video_paths = df["video_name"].values.tolist()
+
+    # `frame_masks` and `frame_features` are what we will feed to our sequence model.
+    # `frame_masks` will contain a bunch of booleans denoting if a timestep is
+    # masked with padding or not.
+    frame_masks = np.zeros(shape=(num_samples, MAX_SEQ_LENGTH), dtype="bool")
+    frame_features = np.zeros(
+        shape=(num_samples, MAX_SEQ_LENGTH, NUM_FEATURES), dtype="float32"
+    )
+
+    # For each video.
+    for idx, path in enumerate(video_paths):
+        # Gather all its frames and add a batch dimension.
+        frames = load_video(os.path.join(root_dir, path))
+    return frames
+
+history = model.fit(x=tmp,y=train_labels_onehot,batch_size=32, epochs=50,validation_data=(tmp2,test_labels_onehot))
+
+import matplotlib.pyplot as plt
+
+loss=history.history['loss']
+val_loss=history.history['val_loss']
+
+nb_epoch=len(loss)
+print("loss_accuracy", "loss_accuracy*100%")
+plt.plot(range(nb_epoch),loss,marker=',',label='train_data')
+plt.plot(range(nb_epoch),val_loss,marker=',',label='test_data')
+plt.legend(loc='best',fontsize=15)
+plt.xlim([0,50])
+plt.ylim([0.0,0.2])
+plt.grid()
+plt.xlabel('epoch',fontsize=18)
+plt.ylabel('loss',fontsize=18)
+plt.show()
+
+accuracy = history.history['accuracy']
+val_accuracy = history.history['val_accuracy']
+
+nb_epoch = len(accuracy)
+plt.plot(range(nb_epoch), accuracy, marker='.', label='train_data')
+plt.plot(range(nb_epoch), val_accuracy, marker='.', label='test_data')
+plt.legend(loc='best', fontsize=15)
+plt.ylim([0.0,1.01])
+plt.xlabel('epoch',fontsize=18)
+plt.ylabel('accuracy',fontsize=18)
+
+plt.show()
+
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 1. テストデータに対して予測を取得
+test_predictions = model.predict(tmp2)
+test_predictions_classes = np.argmax(test_predictions, axis=1)
+
+# 2. 混同行列を計算
+conf_matrix = confusion_matrix(test_labels, test_predictions_classes)
+
+class_labels = ['clove', 'gekko', 'jett', 'omen', 'viper','pheonix']
+
+# 3. 混同行列ディスプレイを作成
+disp = ConfusionMatrixDisplay(confusion_matrix=conf_matrix,display_labels=class_labels)
+
+# 4. 混同行列を表示
+plt.figure(figsize=(10, 8))  # サイズを指定 (幅, 高さ)
+disp.plot(cmap=plt.cm.Blues, ax=plt.gca())  # `ax=plt.gca()`を指定して現在の軸にプロット
+
+# 文字のサイズを調整
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.xlabel('Predicted label', fontsize=16)
+plt.ylabel('True label', fontsize=16)
+plt.title('Confusion Matrix', fontsize=18)
+
+# 混同行列の数字のサイズを調整
+for text in disp.text_.ravel():
+    text.set_fontsize(18)  # 数字のフォントサイズを設定
+
+plt.show()  # プロットを表示
+
+
+
+
+
